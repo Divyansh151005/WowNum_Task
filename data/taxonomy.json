@@ -1,0 +1,42 @@
+{
+  "version": "test-1",
+  "dishes": [
+    {
+      "id": "greek_salad",
+      "name": "Greek Salad",
+      "aliases": ["greek salad", "salad greek"],
+      "ingredients": ["Tomatoes", "Cucumbers", "Olives", "Feta"],
+      "macros_per_100g": { "calories": 75, "protein": 3, "carbs": 5, "fat": 5, "fiber": 1 }
+    },
+    {
+      "id": "fried_rice",
+      "name": "Fried Rice",
+      "aliases": ["egg fried rice", "yangzhou fried rice", "sinangag"],
+      "ingredients": ["Rice", "Egg", "Peas", "Carrot", "Soy Sauce"],
+      "macros_per_100g": { "calories": 170, "protein": 4, "carbs": 28, "fat": 3, "fiber": 1 }
+    },
+    {
+      "id": "ramen_tonkotsu",
+      "name": "Tonkotsu Ramen",
+      "aliases": ["ramen", "pork bone ramen", "tonkotsu"],
+      "ingredients": ["Noodles", "Pork Broth", "Chashu", "Egg", "Nori"],
+      "macros_per_100g": { "calories": 120, "protein": 7, "carbs": 15, "fat": 3, "fiber": 1 }
+    },
+    {
+      "id": "chicken_adobo",
+      "name": "Chicken Adobo",
+      "aliases": ["adobo", "adobong manok"],
+      "ingredients": ["Chicken", "Soy Sauce", "Vinegar", "Garlic", "Bay Leaf"],
+      "macros_per_100g": { "calories": 145, "protein": 18, "carbs": 2, "fat": 6, "fiber": 0 }
+    },
+    {
+      "id": "caesar_salad",
+      "name": "Caesar Salad",
+      "aliases": ["chicken caesar salad", "caesar"],
+      "ingredients": ["Lettuce", "Croutons", "Parmesan", "Chicken", "Caesar Dressing"],
+      "macros_per_100g": { "calories": 95, "protein": 5, "carbs": 6, "fat": 6, "fiber": 1 }
+    }
+  ]
+}
+
+
