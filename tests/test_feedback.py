@@ -12,6 +12,7 @@ def test_health():
 
 
 def test_post_and_export_and_stats():
+    headers = {"Authorization": "Bearer demo-key-123"}
     payload = {
         "imageId": "abc123",
         "original": {"name": "Fried Rice", "grams": 250},
@@ -21,7 +22,7 @@ def test_post_and_export_and_stats():
             {"ingredient": "Noodles", "deltaGrams": 50}
         ],
     }
-    r = client.post("/api/feedback/correction", json=payload)
+    r = client.post("/api/feedback/correction", json=payload, headers=headers)
     assert r.status_code == 201
     body = r.json()
     assert body["imageId"] == "abc123"
@@ -29,14 +30,14 @@ def test_post_and_export_and_stats():
     assert body["corrected"]["name"] == "Tonkotsu Ramen"
     assert isinstance(body.get("adjustments"), list)
 
-    r2 = client.get("/api/feedback/export?format=jsonl")
+    r2 = client.get("/api/feedback/export?format=jsonl", headers=headers)
     assert r2.status_code == 200
     lines = r2.text.strip().splitlines()
     assert len(lines) >= 1
     # Ensure adjustments field present in JSONL
     assert '"adjustments"' in lines[-1]
 
-    r3 = client.get("/api/feedback/stats")
+    r3 = client.get("/api/feedback/stats", headers=headers)
     assert r3.status_code == 200
     data = r3.json()
     assert "top5" in data

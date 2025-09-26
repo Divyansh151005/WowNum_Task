@@ -1,180 +1,235 @@
-from __future__ import annotations
+"""Feedback collection endpoints with streaming and structured data."""
 
-from datetime import datetime
-from typing import Iterable, Literal, Optional
-
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy import Column, DateTime, Integer, String, create_engine, func, select
-from sqlalchemy.orm import Session, sessionmaker, declarative_base
-from pydantic import BaseModel, Field, ConfigDict
 import csv
 import io
-import os
 import json
+from typing import Iterator, Dict, Any
 
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, selectinload
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./feedback.db")
-
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-
-class FeedbackCorrection(Base):
-    __tablename__ = "feedback_corrections"
-
-    id = Column(Integer, primary_key=True, index=True)
-    image_id = Column(String, index=True, nullable=False)
-    original_name = Column(String, nullable=False)
-    original_grams = Column(Integer, nullable=False)
-    corrected_name = Column(String, index=True, nullable=False)
-    corrected_grams = Column(Integer, nullable=False)
-    # Optional per-ingredient adjustments, stored as JSON string
-    adjustments_json = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
-
-
-def create_tables() -> None:
-    Base.metadata.create_all(bind=engine)
-    # Lightweight migration: add adjustments_json if missing
-    with engine.connect() as conn:
-        cols = conn.exec_driver_sql("PRAGMA table_info(feedback_corrections)").fetchall()
-        col_names = {c[1] for c in cols}
-        if "adjustments_json" not in col_names:
-            conn.exec_driver_sql(
-                "ALTER TABLE feedback_corrections ADD COLUMN adjustments_json TEXT"
-            )
-            conn.commit()
-
-
-def get_db() -> Iterable[Session]:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-class DishPortion(BaseModel):
-    name: str = Field(..., min_length=1, max_length=200)
-    grams: int = Field(..., ge=1, le=10000)
-
-
-class CorrectionIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    imageId: str = Field(..., min_length=1, max_length=200)
-    original: DishPortion
-    corrected: DishPortion
-    adjustments: Optional[list[dict]] = Field(
-        default=None,
-        description="Optional list of per-ingredient adjustments, e.g., [{ingredient, deltaGrams}]",
-    )
-
-
-class ExportFormat(BaseModel):
-    fmt: Literal["csv", "jsonl"] = Field(default="jsonl")
-
+from app.database import get_db
+from app.models import FeedbackCorrection, IngredientAdjustment, DishTaxonomy
+from app.schemas import CorrectionIn, CorrectionOut, StatsOut, HealthOut
+from app.auth import verify_api_key
+from app.security import limiter, get_rate_limits
 
 router = APIRouter()
+rate_limits = get_rate_limits()
 
 
-@router.post("/correction", status_code=201)
-def post_correction(payload: CorrectionIn, db: Session = Depends(get_db)) -> JSONResponse:
-    rec = FeedbackCorrection(
-        image_id=payload.imageId,
-        original_name=payload.original.name,
-        original_grams=payload.original.grams,
-        corrected_name=payload.corrected.name,
-        corrected_grams=payload.corrected.grams,
-        adjustments_json=json.dumps(payload.adjustments) if payload.adjustments is not None else None,
-    )
-    db.add(rec)
-    db.commit()
-    db.refresh(rec)
-    return JSONResponse(
-        status_code=201,
-        content={
-            "id": rec.id,
-            "imageId": rec.image_id,
-            "original": {"name": rec.original_name, "grams": rec.original_grams},
-            "corrected": {"name": rec.corrected_name, "grams": rec.corrected_grams},
-            **({"adjustments": json.loads(rec.adjustments_json)} if rec.adjustments_json else {}),
-            "createdAt": rec.created_at.isoformat() + "Z",
-        },
-    )
+@router.get("/health", response_model=HealthOut)
+def health_check() -> HealthOut:
+    """Health check endpoint."""
+    return HealthOut(status="ok")
+
+
+@router.get("/healthz", response_model=HealthOut)
+def health_check_alt() -> HealthOut:
+    """Alternative health check endpoint."""
+    return HealthOut(status="ok")
+
+
+@router.post("/correction", response_model=CorrectionOut, status_code=status.HTTP_201_CREATED)
+def post_correction(
+    payload: CorrectionIn,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(verify_api_key)
+) -> CorrectionOut:
+    """Store a user correction with optional per-ingredient adjustments."""
+    
+    try:
+        # Create the main correction record
+        correction = FeedbackCorrection(
+            image_id=payload.imageId,
+            original_name=payload.original.name,
+            original_grams=payload.original.grams,
+            corrected_name=payload.corrected.name,
+            corrected_grams=payload.corrected.grams,
+        )
+        
+        db.add(correction)
+        db.flush()  # Get the ID
+        
+        # Add ingredient adjustments if provided
+        if payload.adjustments:
+            for adj in payload.adjustments:
+                adjustment = IngredientAdjustment(
+                    correction_id=correction.id,
+                    ingredient=adj.ingredient,
+                    delta_grams=adj.deltaGrams,
+                    notes=adj.notes,
+                )
+                db.add(adjustment)
+        
+        db.commit()
+        db.refresh(correction)
+        
+        # Load adjustments for response
+        db.refresh(correction, ["adjustments"])
+        
+        return CorrectionOut(
+            id=correction.id,
+            imageId=correction.image_id,
+            original=payload.original,
+            corrected=payload.corrected,
+            adjustments=[
+                {
+                    "ingredient": adj.ingredient,
+                    "deltaGrams": adj.delta_grams,
+                    "notes": adj.notes,
+                }
+                for adj in correction.adjustments
+            ] if correction.adjustments else None,
+            createdAt=correction.created_at,
+        )
+        
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to store correction: {str(e)}"
+        )
 
 
 @router.get("/export")
 def export_feedback(
     format: str = Query("jsonl", pattern="^(csv|jsonl)$"),
     db: Session = Depends(get_db),
+    current_user: dict = Depends(verify_api_key)
 ):
-    stmt = select(FeedbackCorrection).order_by(FeedbackCorrection.id.asc())
-    rows = list(db.scalars(stmt))
+    """Stream all corrections in JSONL or CSV format."""
+    
+    try:
+        # Query with eager loading of adjustments
+        stmt = (
+            select(FeedbackCorrection)
+            .options(selectinload(FeedbackCorrection.adjustments))
+            .order_by(FeedbackCorrection.id.asc())
+        )
+        
+        if format == "jsonl":
+            return StreamingResponse(
+                _stream_jsonl(db, stmt),
+                media_type="application/x-jsonlines",
+                headers={"Content-Disposition": "attachment; filename=feedback.jsonl"}
+            )
+        else:
+            return StreamingResponse(
+                _stream_csv(db, stmt),
+                media_type="text/csv",
+                headers={"Content-Disposition": "attachment; filename=feedback.csv"}
+            )
+            
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to export data: {str(e)}"
+        )
 
-    if format == "jsonl":
-        def iter_jsonl():
-            for r in rows:
-                obj = {
-                    "id": r.id,
-                    "imageId": r.image_id,
-                    "original": {"name": r.original_name, "grams": r.original_grams},
-                    "corrected": {"name": r.corrected_name, "grams": r.corrected_grams},
-                    "createdAt": r.created_at.isoformat() + "Z",
+
+def _stream_jsonl(db: Session, stmt) -> Iterator[str]:
+    """Stream corrections as JSONL."""
+    result = db.execute(stmt)
+    
+    for correction in result.scalars():
+        obj = {
+            "id": correction.id,
+            "imageId": correction.image_id,
+            "original": {
+                "name": correction.original_name,
+                "grams": correction.original_grams
+            },
+            "corrected": {
+                "name": correction.corrected_name,
+                "grams": correction.corrected_grams
+            },
+            "createdAt": correction.created_at.isoformat() + "Z"
+        }
+        
+        if correction.adjustments:
+            obj["adjustments"] = [
+                {
+                    "ingredient": adj.ingredient,
+                    "deltaGrams": adj.delta_grams,
+                    "notes": adj.notes,
                 }
-                if r.adjustments_json:
-                    try:
-                        obj["adjustments"] = json.loads(r.adjustments_json)
-                    except Exception:
-                        obj["adjustments"] = r.adjustments_json
-                yield json.dumps(obj) + "\n"
+                for adj in correction.adjustments
+            ]
+        
+        yield json.dumps(obj) + "\n"
 
-        return StreamingResponse(iter_jsonl(), media_type="application/x-jsonlines")
 
-    # CSV
+def _stream_csv(db: Session, stmt) -> Iterator[str]:
+    """Stream corrections as CSV."""
+    # Create CSV header
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(
-        [
-            "id",
-            "imageId",
-            "original_name",
-            "original_grams",
-            "corrected_name",
-            "corrected_grams",
-            "adjustments",
-            "createdAt",
-        ]
-    )
-    for r in rows:
-        writer.writerow(
-            [
-                r.id,
-                r.image_id,
-                r.original_name,
-                r.original_grams,
-                r.corrected_name,
-                r.corrected_grams,
-                r.adjustments_json or "",
-                r.created_at.isoformat() + "Z",
+    writer.writerow([
+        "id", "imageId", "original_name", "original_grams",
+        "corrected_name", "corrected_grams", "adjustments", "createdAt"
+    ])
+    yield buffer.getvalue()
+    buffer.close()
+    
+    # Stream data rows
+    result = db.execute(stmt)
+    
+    for correction in result.scalars():
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        
+        adjustments_json = ""
+        if correction.adjustments:
+            adjustments_data = [
+                {
+                    "ingredient": adj.ingredient,
+                    "deltaGrams": adj.delta_grams,
+                    "notes": adj.notes,
+                }
+                for adj in correction.adjustments
             ]
+            adjustments_json = json.dumps(adjustments_data)
+        
+        writer.writerow([
+            correction.id,
+            correction.image_id,
+            correction.original_name,
+            correction.original_grams,
+            correction.corrected_name,
+            correction.corrected_grams,
+            adjustments_json,
+            correction.created_at.isoformat() + "Z"
+        ])
+        
+        yield buffer.getvalue()
+        buffer.close()
+
+
+@router.get("/stats", response_model=StatsOut)
+def feedback_stats(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(verify_api_key)
+) -> StatsOut:
+    """Get top 5 corrected labels with counts."""
+    
+    try:
+        stmt = (
+            select(FeedbackCorrection.corrected_name, func.count().label("count"))
+            .group_by(FeedbackCorrection.corrected_name)
+            .order_by(func.count().desc(), FeedbackCorrection.corrected_name.asc())
+            .limit(5)
         )
-    buffer.seek(0)
-    return StreamingResponse(buffer, media_type="text/csv")
-
-
-@router.get("/stats")
-def feedback_stats(db: Session = Depends(get_db)) -> dict[str, list[dict[str, int | str]]]:
-    stmt = (
-        select(FeedbackCorrection.corrected_name, func.count().label("count"))
-        .group_by(FeedbackCorrection.corrected_name)
-        .order_by(func.count().desc(), FeedbackCorrection.corrected_name.asc())
-        .limit(5)
-    )
-    results = db.execute(stmt).all()
-    top = [{"label": name, "count": int(count)} for name, count in results]
-    return {"top5": top}
-
-
+        
+        results = db.execute(stmt).all()
+        top5 = [{"label": name, "count": int(count)} for name, count in results]
+        
+        return StatsOut(top5=top5)
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get stats: {str(e)}"
+        )
